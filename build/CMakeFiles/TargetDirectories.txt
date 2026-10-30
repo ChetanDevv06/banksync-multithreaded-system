@@ -1,4 +1,0 @@
-E:/Coding Projects/OS Assignment/build/CMakeFiles/banksync.dir
-E:/Coding Projects/OS Assignment/build/CMakeFiles/test_bank.dir
-E:/Coding Projects/OS Assignment/build/CMakeFiles/edit_cache.dir
-E:/Coding Projects/OS Assignment/build/CMakeFiles/rebuild_cache.dir
