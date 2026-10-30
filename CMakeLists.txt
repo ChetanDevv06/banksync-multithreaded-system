@@ -25,3 +25,10 @@ add_executable(test_bank
 )
 target_link_libraries(test_bank PRIVATE Threads::Threads)
 target_include_directories(test_bank PRIVATE include)
+
+add_executable(test_thread_pool
+    tests/test_thread_pool.c
+    src/thread_pool.c
+)
+target_link_libraries(test_thread_pool PRIVATE Threads::Threads)
+target_include_directories(test_thread_pool PRIVATE include)
