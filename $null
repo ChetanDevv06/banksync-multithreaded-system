@@ -1,0 +1,27 @@
+TEST: test_a_init_success
+TEST: test_a2_invalid_timeout_zero
+TEST: test_a3_invalid_timeout_negative
+TEST: test_a4_invalid_timeout_too_large
+TEST: test_a5_invalid_timeout_too_small
+TEST: test_a6_null_experiment
+TEST: test_a7_run_before_init
+TEST: test_a8_run_null_result
+TEST: test_a9_destroy_uninitialized
+TEST: test_a10_destroy_null
+TEST: test_a11_already_initialized
+TEST: test_a12_destroy_then_reinit
+TEST: test_b_helper_started_and_deadlock_detected
+TEST: test_b2_watchdog_termination_flag
+TEST: test_b3_no_indefinite_blocking
+TEST: test_b4_repeated_execution
+TEST: test_c_missing_helper_executable
+TEST: test_c2_unexpected_helper_exit
+TEST: test_c3_launch_failure_distinct_from_deadlock
+TEST: test_d_cleanup_succeeds
+TEST: test_d_destroy_after_run
+
+==============================
+Tests run: 78
+Tests passed: 78
+Tests failed: 0
+==============================

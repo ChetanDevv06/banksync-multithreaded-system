@@ -51,3 +51,29 @@ add_executable(test_session_manager
 )
 target_link_libraries(test_session_manager PRIVATE Threads::Threads)
 target_include_directories(test_session_manager PRIVATE include)
+
+add_executable(test_race_experiment
+    tests/test_race_experiment.c
+    src/race_experiment.c
+)
+target_link_libraries(test_race_experiment PRIVATE Threads::Threads)
+target_include_directories(test_race_experiment PRIVATE include)
+
+add_executable(deadlock_helper
+    src/deadlock_helper.c
+)
+target_link_libraries(deadlock_helper PRIVATE Threads::Threads)
+target_include_directories(deadlock_helper PRIVATE include)
+set_target_properties(deadlock_helper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+add_executable(test_deadlock_experiment
+    tests/test_deadlock_experiment.c
+    src/deadlock_experiment.c
+)
+target_link_libraries(test_deadlock_experiment PRIVATE Threads::Threads)
+target_include_directories(test_deadlock_experiment PRIVATE include)
+set_target_properties(test_deadlock_experiment PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+target_compile_definitions(test_deadlock_experiment PRIVATE
+    "DEADLOCK_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/deadlock_helper${CMAKE_EXECUTABLE_SUFFIX}\"")
