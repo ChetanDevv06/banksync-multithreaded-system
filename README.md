@@ -400,30 +400,19 @@ BankSync is being developed incrementally through seven major phases.
 
 ### Phase 3 — Multithreading Infrastructure
 
-- [ ] M3.1 — POSIX Thread Pool
-- [ ] M3.2 — Transaction Queue
-- [ ] M3.3 — Concurrent ATM Sessions
-- [ ] M3.4 — Concurrent Online Banking
-- [ ] M3.5 — Worker Lifecycle Monitoring
+- [x] M3.1 — POSIX Thread Pool
+- [x] M3.2 — Transaction Queue
+- [x] M3.3 — Concurrent ATM Sessions
+- [x] M3.4 — Concurrent Online Banking
+- [x] M3.5 — Worker Lifecycle Monitoring
 
 ### Phase 4 — OS Synchronization Experiments
 
-- [ ] M4.1 — Unsafe Execution Demonstration
+- [x] M4.1 — Unsafe Execution Demonstration
 - [ ] M4.2 — Race Condition Experiment
 - [ ] M4.3 — Mutex Synchronization Demonstration
 - [ ] M4.4 — Deadlock Simulation
 - [ ] M4.5 — Deadlock Prevention
-
-### Phase 5 — Graphical User Interface
-
-- [ ] Dashboard
-- [ ] ATM Interface
-- [ ] Online Banking Interface
-- [ ] Account Management Interface
-- [ ] Transaction History
-- [ ] Thread Monitoring Dashboard
-- [ ] Concurrency and Deadlock Lab
-
 ---
 
 ## Design Principles
