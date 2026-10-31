@@ -32,3 +32,22 @@ add_executable(test_thread_pool
 )
 target_link_libraries(test_thread_pool PRIVATE Threads::Threads)
 target_include_directories(test_thread_pool PRIVATE include)
+
+add_executable(test_transaction_manager
+    tests/test_transaction_manager.c
+    src/transaction_manager.c
+    src/bank.c
+    src/thread_pool.c
+)
+target_link_libraries(test_transaction_manager PRIVATE Threads::Threads)
+target_include_directories(test_transaction_manager PRIVATE include)
+
+add_executable(test_session_manager
+    tests/test_session_manager.c
+    src/session_manager.c
+    src/transaction_manager.c
+    src/thread_pool.c
+    src/bank.c
+)
+target_link_libraries(test_session_manager PRIVATE Threads::Threads)
+target_include_directories(test_session_manager PRIVATE include)
