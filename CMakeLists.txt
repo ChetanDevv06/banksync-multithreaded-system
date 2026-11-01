@@ -16,6 +16,12 @@ include_directories(include)
 add_executable(banksync
     src/main.c
     src/bank.c
+    src/application.c
+    src/cli.c
+    src/money_utils.c
+    src/thread_pool.c
+    src/transaction_manager.c
+    src/session_manager.c
 )
 target_link_libraries(banksync PRIVATE Threads::Threads)
 
@@ -77,3 +83,101 @@ set_target_properties(test_deadlock_experiment PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_definitions(test_deadlock_experiment PRIVATE
     "DEADLOCK_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/deadlock_helper${CMAKE_EXECUTABLE_SUFFIX}\"")
+
+add_executable(test_deadlock_prevention
+    tests/test_deadlock_prevention.c
+    src/deadlock_prevention.c
+)
+target_link_libraries(test_deadlock_prevention PRIVATE Threads::Threads)
+target_include_directories(test_deadlock_prevention PRIVATE include)
+set_target_properties(test_deadlock_prevention PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+add_executable(test_application
+    tests/test_application.c
+    src/application.c
+    src/bank.c
+    src/thread_pool.c
+    src/transaction_manager.c
+    src/session_manager.c
+)
+target_link_libraries(test_application PRIVATE Threads::Threads)
+target_include_directories(test_application PRIVATE include)
+set_target_properties(test_application PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+add_executable(test_synchronization_report
+    tests/test_synchronization_report.c
+    src/synchronization_report.c
+    src/race_experiment.c
+    src/deadlock_experiment.c
+    src/deadlock_prevention.c
+)
+target_link_libraries(test_synchronization_report PRIVATE Threads::Threads)
+target_include_directories(test_synchronization_report PRIVATE include)
+set_target_properties(test_synchronization_report PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+target_compile_definitions(test_synchronization_report PRIVATE
+    "DEADLOCK_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/deadlock_helper${CMAKE_EXECUTABLE_SUFFIX}\"")
+
+add_executable(test_cli
+    tests/test_cli.c
+    src/cli.c
+    src/application.c
+    src/bank.c
+    src/money_utils.c
+    src/thread_pool.c
+    src/transaction_manager.c
+    src/session_manager.c
+)
+target_link_libraries(test_cli PRIVATE Threads::Threads)
+target_include_directories(test_cli PRIVATE include)
+set_target_properties(test_cli PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+add_executable(test_money_utils
+    tests/test_money_utils.c
+    src/money_utils.c
+)
+target_link_libraries(test_money_utils PRIVATE Threads::Threads)
+target_include_directories(test_money_utils PRIVATE include)
+set_target_properties(test_money_utils PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+add_executable(test_concurrent_sessions
+    tests/test_concurrent_sessions.c
+    src/application.c
+    src/bank.c
+    src/thread_pool.c
+    src/transaction_manager.c
+    src/session_manager.c
+)
+target_link_libraries(test_concurrent_sessions PRIVATE Threads::Threads)
+target_include_directories(test_concurrent_sessions PRIVATE include)
+set_target_properties(test_concurrent_sessions PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+add_executable(test_concurrent_transactions
+    tests/test_concurrent_transactions.c
+    src/bank.c
+    src/thread_pool.c
+    src/transaction_manager.c
+    src/session_manager.c
+)
+target_link_libraries(test_concurrent_transactions PRIVATE Threads::Threads)
+target_include_directories(test_concurrent_transactions PRIVATE include)
+set_target_properties(test_concurrent_transactions PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+add_executable(test_concurrent_integration
+    tests/test_concurrent_integration.c
+    src/application.c
+    src/bank.c
+    src/thread_pool.c
+    src/transaction_manager.c
+    src/session_manager.c
+)
+target_link_libraries(test_concurrent_integration PRIVATE Threads::Threads)
+target_include_directories(test_concurrent_integration PRIVATE include)
+set_target_properties(test_concurrent_integration PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")

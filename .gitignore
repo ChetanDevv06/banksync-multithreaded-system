@@ -29,3 +29,8 @@ desktop.ini
 
 # Logs
 *.log
+
+#Agents
+.kilo
+.agents
+.claude
