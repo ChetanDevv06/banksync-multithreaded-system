@@ -6,11 +6,37 @@
 #include <string.h>
 #include <ctype.h>
 
+#if defined(_WIN32)
+#  include <io.h>
+#  include <windows.h>
+#else
+#  include <unistd.h>
+#  include <sys/ioctl.h>
+#endif
+
 /*
  * CLI input buffer size. Large enough for normal input; lines longer than
  * this are truncated and the remainder discarded.
  */
 #define CLI_INPUT_BUFFER_SIZE 256
+
+/*
+ * Default terminal width used when width detection is unavailable (e.g. stdout
+ * is not a TTY).
+ */
+#define CLI_DEFAULT_WIDTH 80
+
+/*
+ * Nominal width of the centred composition. Separators and panel borders are
+ * drawn at this width; all content shares a common left offset so the entire
+ * layout is centred as one consistent visual composition.
+ */
+#define CLI_BLOCK_WIDTH CLI_SEP_WIDTH
+
+/*
+ * Width of horizontal separator lines.
+ */
+#define CLI_SEP_WIDTH 42
 
 /*
  * Main menu option constants.
@@ -68,6 +94,54 @@ typedef struct CliSessionContext {
     char account_number[20];
 } CliSessionContext;
 
+/*
+ * Terminal colour state. Disabled by default; enabled in cli_run() only when
+ * stdout is a TTY (and virtual terminal processing is enabled on Windows).
+ * Tests that inject a mock IO sink never enable colour, so their output
+ * remains plain text and free of escape sequences.
+ */
+static int cli_colour = 0;
+
+/* ANSI escape sequences. Each is emitted as a complete, non-interleaved unit
+ * so they never split visible text or interfere with alignment. */
+#define C_RESET   "\033[0m"
+#define C_BOLD    "\033[1m"
+#define C_CYAN    "\033[36m"      /* application branding */
+#define C_BRIGHT_CYAN "\033[1;36m"/* section headings */
+#define C_WHITE   "\033[37m"      /* menu options */
+#define C_BRIGHT_WHITE "\033[1;37m" /* important values */
+#define C_GREEN   "\033[32m"      /* success messages */
+#define C_RED     "\033[31m"      /* error messages */
+#define C_YELLOW  "\033[33m"      /* warnings */
+#define C_GRAY    "\033[2;37m"    /* secondary information */
+#define C_DARK_GRAY "\033[90m"    /* borders and separators */
+
+#if defined(_WIN32)
+static void cli_enable_vt_processing(void)
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    if (!GetConsoleMode(h, &mode)) {
+        return;
+    }
+    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    (void)SetConsoleMode(h, mode);
+}
+#endif
+
+static int cli_isatty_stream(FILE *stream)
+{
+#if defined(_WIN32)
+    return isatty(_fileno(stream));
+#else
+    return isatty(fileno(stream));
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* Production IO sinks                                                */
 /* ------------------------------------------------------------------ */
@@ -94,6 +168,256 @@ static void cli_write_stdout(const char *text, void *ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/* Terminal width detection                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * cli_terminal_width — detect the current terminal width in columns.
+ * Returns CLI_DEFAULT_WIDTH when stdout is not a TTY or width cannot be
+ * determined. Re-detected on every call so the layout adapts to resizes.
+ */
+static int cli_terminal_width(void)
+{
+    static int cached_width = 0;
+    int width;
+
+    if (cached_width != 0) {
+        return cached_width;
+    }
+
+    width = CLI_DEFAULT_WIDTH;
+
+#if defined(_WIN32)
+    if (cli_isatty_stream(stdout)) {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        if (GetConsoleScreenBufferInfo(h, &csbi)) {
+            width = (int)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+            if (width <= 0) {
+                width = CLI_DEFAULT_WIDTH;
+            }
+        }
+    }
+#else
+    if (cli_isatty_stream(stdout)) {
+        struct winsize w;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) {
+            width = (int)w.ws_col;
+        }
+    }
+#endif
+
+    cached_width = width;
+    return width;
+}
+
+/*
+ * cli_block_offset — common left offset used to centre the entire
+ * composition within the terminal. Every rendered line shares this offset so
+ * borders, separators, panels and contents align as one block.
+ */
+static int cli_block_offset(void)
+{
+    int term_width = cli_terminal_width();
+    int offset = (term_width - CLI_BLOCK_WIDTH) / 2;
+    return offset > 0 ? offset : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Presentation helpers                                               */
+/* ------------------------------------------------------------------ */
+
+static void cli_emit_code(const CliIO *io, const char *code)
+{
+    if (cli_colour && code != NULL && io != NULL && io->write != NULL) {
+        io->write(code, io->ctx);
+    }
+}
+
+static void cli_write(const CliIO *io, const char *text)
+{
+    if (io != NULL && io->write != NULL) {
+        io->write(text, io->ctx);
+    }
+}
+
+static void cli_write_spaces(const CliIO *io, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        cli_write(io, " ");
+    }
+}
+
+static void cli_write_line(const CliIO *io, const char *text)
+{
+    cli_write(io, text);
+    cli_write(io, "\n");
+}
+
+static void cli_write_text(const CliIO *io, const char *text)
+{
+    cli_write(io, text);
+}
+
+/* Write a line with the common centring offset and a trailing newline. */
+static void cli_write_centered_line(const CliIO *io, const char *text)
+{
+    cli_write_spaces(io, cli_block_offset());
+    cli_write_line(io, text);
+}
+/* Write text with the common centring offset, no trailing newline (prompts). */
+static void cli_write_centered_text(const CliIO *io, const char *text)
+{
+    cli_write_spaces(io, cli_block_offset());
+    cli_write(io, text);
+}
+
+/* Write a colour-wrapped line with the common centring offset. */
+static void cli_color_line_centered(const CliIO *io, const char *color,
+                                    const char *text)
+{
+    cli_write_spaces(io, cli_block_offset());
+    cli_emit_code(io, color);
+    cli_write_line(io, text);
+    cli_emit_code(io, C_RESET);
+}
+
+/* Message renderers. Core phrases stay contiguous so substring-based tests
+ * pass regardless of colour state or leading centring spaces. */
+static void cli_success_centered(const CliIO *io, const char *text)
+{
+    cli_write_spaces(io, cli_block_offset());
+    cli_emit_code(io, C_GREEN);
+    cli_write_text(io, "[OK] ");
+    cli_emit_code(io, C_RESET);
+    cli_write_line(io, text);
+}
+
+static void cli_error_centered(const CliIO *io, const char *text)
+{
+    cli_write_spaces(io, cli_block_offset());
+    cli_emit_code(io, C_RED);
+    cli_write_text(io, "[!] ");
+    cli_emit_code(io, C_RESET);
+    cli_write_line(io, text);
+}
+
+static const char *cli_bank_status_message(BankStatus bs)
+{
+    switch (bs) {
+    case BANK_SUCCESS:
+        return "Success";
+    case BANK_ERROR_INSUFFICIENT_FUNDS:
+        return "Insufficient funds";
+    case BANK_ERROR_INVALID_AMOUNT:
+        return "Invalid amount";
+    case BANK_ERROR_BALANCE_OVERFLOW:
+        return "Balance overflow";
+    case BANK_ERR_ACCOUNT_NOT_FOUND:
+        return "Account not found";
+    case BANK_ERR_INVALID_ARGUMENT:
+        return "Invalid argument";
+    case BANK_ERR_DUPLICATE_ACCOUNT:
+        return "Duplicate account";
+    case BANK_ERR_MAX_CAPACITY:
+        return "Maximum capacity reached";
+    case BANK_ERR_MUTEX_INIT_FAILED:
+        return "Mutex initialization failed";
+    case BANK_ERR_INVALID_NAME:
+        return "Invalid customer name";
+    case BANK_ERROR_MUTEX_LOCK:
+        return "Mutex lock failed";
+    case BANK_ERROR_MUTEX_UNLOCK:
+        return "Mutex unlock failed";
+    case BANK_ERROR_HISTORY_FULL:
+        return "Transaction history full";
+    case BANK_ERROR_BUFFER_TOO_SMALL:
+        return "Buffer too small";
+    default:
+        return "Unknown bank error";
+    }
+}
+
+static void cli_menu_item(const CliIO *io, int number, const char *label)
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf), "  %d. %s", number, label);
+    cli_write_centered_line(io, buf);
+}
+
+static void cli_prompt(const CliIO *io, const char *text)
+{
+    cli_emit_code(io, C_BRIGHT_CYAN);
+    cli_write_centered_text(io, text);
+    cli_emit_code(io, C_RESET);
+}
+
+static int cli_format_amount(int64_t amount_paise, char *buf, size_t size)
+{
+    return money_format_rupees(amount_paise, buf, size);
+}
+
+/* Display an account balance using the existing integer-paise formatter. */
+static void cli_display_balance(const CliIO *io, int64_t balance_paise)
+{
+    char buf[64];
+    int n = money_format_rupees(balance_paise, buf, sizeof(buf));
+    if (n < 0) {
+        cli_write_centered_line(io, "Balance: <error>");
+    } else {
+        char line[128];
+        snprintf(line, sizeof(line), "Balance: %s", buf);
+        cli_write_centered_line(io, line);
+    }
+}
+
+/* Fetch and display the live balance for an account after a mutating
+ * operation. Read-only; does not alter balances or semantics. */
+static void cli_show_updated_balance(const CliIO *io, Application *app,
+                                     int account_id)
+{
+    Bank *bank = application_get_bank(app);
+    int64_t balance = 0;
+    BankStatus bs;
+
+    if (bank == NULL) {
+        cli_write_centered_line(io, "Updated balance: <unavailable>");
+        return;
+    }
+    bs = bank_get_balance(bank, account_id, &balance);
+    if (bs != BANK_SUCCESS) {
+        cli_write_centered_line(io, "Updated balance: <unavailable>");
+        return;
+    }
+    {
+        char line[128];
+        char amt[64];
+        if (money_format_rupees(balance, amt, sizeof(amt)) < 0) {
+            cli_write_centered_line(io, "Updated balance: <error>");
+        } else {
+            snprintf(line, sizeof(line), "Updated balance: %s", amt);
+            cli_write_centered_line(io, line);
+        }
+    }
+}
+
+/* Horizontal separator frame line (fixed width, centred with the block). */
+static void cli_sep(const CliIO *io, char ch)
+{
+    char buf[CLI_SEP_WIDTH + 1];
+    int i;
+
+    for (i = 0; i < CLI_SEP_WIDTH; i++) {
+        buf[i] = ch;
+    }
+    buf[CLI_SEP_WIDTH] = '\0';
+    cli_emit_code(io, C_DARK_GRAY);
+    cli_write_centered_line(io, buf);
+    cli_emit_code(io, C_RESET);
+}
+
+/* ------------------------------------------------------------------ */
 /* Input parsing helpers                                              */
 /* ------------------------------------------------------------------ */
 
@@ -107,13 +431,6 @@ static int cli_read_line(const CliIO *io, char *buf, size_t size)
         return -1;
     }
     return io->read_line(buf, size, io->ctx);
-}
-
-static void cli_write(const CliIO *io, const char *text)
-{
-    if (io != NULL && io->write != NULL) {
-        io->write(text, io->ctx);
-    }
 }
 
 /*
@@ -236,88 +553,111 @@ static int cli_submit_transaction(SessionManager *sm,
 
 static void cli_render_banner(const CliIO *io)
 {
-    cli_write(io, "========================================\n");
-    cli_write(io, "              BANKSYNC\n");
-    cli_write(io, "       MULTITHREADED BANKING SYSTEM\n");
-    cli_write(io, "========================================\n");
+    cli_write_line(io, "");
+    cli_sep(io, '=');
+    cli_color_line_centered(io, C_BRIGHT_CYAN, "              BANKSYNC");
+    cli_color_line_centered(io, C_CYAN, "     MULTITHREADED BANKING SYSTEM");
+    cli_sep(io, '=');
+    cli_write_line(io, "");
 }
 
 static void cli_render_main_menu(const CliIO *io)
 {
-    cli_write(io, "\n");
-    cli_write(io, "1. ATM Banking\n");
-    cli_write(io, "2. Online Banking\n");
-    cli_write(io, "3. Exit\n");
-    cli_write(io, "Select an option: ");
+    cli_sep(io, '-');
+    cli_color_line_centered(io, C_BRIGHT_CYAN, "             MAIN MENU");
+    cli_sep(io, '-');
+    cli_write_line(io, "");
+    cli_menu_item(io, CLI_OPTION_ATM, "ATM Banking");
+    cli_menu_item(io, CLI_OPTION_ONLINE_BANKING, "Online Banking");
+    cli_menu_item(io, CLI_OPTION_EXIT, "Exit");
+    cli_write_line(io, "");
+    cli_color_line_centered(io, C_GRAY, "  Tip: Enter the number of your choice (1-3).");
+    cli_prompt(io, "Select an option: ");
 }
 
 static void cli_render_account_selection(const CliIO *io, const Bank *bank)
 {
-    char buf[128];
+    char buf[256];
+    int i;
 
-    cli_write(io, "\n========================================\n");
-    cli_write(io, "          SELECT CUSTOMER ACCOUNT\n");
-    cli_write(io, "========================================\n");
-
-    for (int i = 0; i < bank->account_count; i++) {
+    cli_write_line(io, "");
+    cli_sep(io, '=');
+    cli_color_line_centered(io, C_BRIGHT_CYAN, "          SELECT CUSTOMER ACCOUNT");
+    cli_sep(io, '=');
+    cli_write_line(io, "");
+    cli_write_centered_line(io, "  Available accounts:");
+    for (i = 0; i < bank->account_count; i++) {
         const BankAccount *acc = &bank->accounts[i];
-        snprintf(buf, sizeof(buf), "Account ID: %d\n", acc->account_id);
-        cli_write(io, buf);
-        snprintf(buf, sizeof(buf), "Customer: %s\n", acc->customer_name);
-        cli_write(io, buf);
-        snprintf(buf, sizeof(buf), "Account Number: %s\n", acc->account_number);
-        cli_write(io, buf);
-        cli_write(io, "----------------------------------------\n");
+        cli_sep(io, '-');
+        snprintf(buf, sizeof(buf), "  Account ID: %d", acc->account_id);
+        cli_write_centered_line(io, buf);
+        snprintf(buf, sizeof(buf), "  Customer: %s", acc->customer_name);
+        cli_write_centered_line(io, buf);
+        snprintf(buf, sizeof(buf), "  Account Number: %s", acc->account_number);
+        cli_write_centered_line(io, buf);
     }
-
-    cli_write(io, "Enter Account ID: ");
+    if (bank->account_count > 0) {
+        cli_sep(io, '-');
+    }
+    cli_write_line(io, "");
+    cli_prompt(io, "Enter Account ID: ");
 }
 
 static void cli_render_session_created(const CliIO *io, const CliSessionContext *ctx)
 {
     char buf[256];
+    const char *channel_text =
+        ctx->channel == SESSION_CHANNEL_ATM ? "ATM" : "Online Banking";
 
-    cli_write(io, "\n========================================\n");
-    cli_write(io, "          SESSION CREATED\n");
-    cli_write(io, "========================================\n");
-
-    snprintf(buf, sizeof(buf), "Customer: %s\n", ctx->customer_name);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Account ID: %d\n", ctx->account_id);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Account Number: %s\n", ctx->account_number);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Channel: %s\n",
-             ctx->channel == SESSION_CHANNEL_ATM ? "ATM" : "Online Banking");
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Session ID: %llu\n",
+    cli_write_line(io, "");
+    cli_sep(io, '=');
+    cli_color_line_centered(io, C_BRIGHT_CYAN, "          SESSION CREATED");
+    cli_sep(io, '=');
+    cli_write_line(io, "");
+    snprintf(buf, sizeof(buf), "  Status: ACTIVE");
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Customer: %s", ctx->customer_name);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Account ID: %d", ctx->account_id);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Account Number: %s", ctx->account_number);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Channel: %s", channel_text);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Session ID: %llu",
              (unsigned long long)ctx->session_id);
-    cli_write(io, buf);
-    cli_write(io, "Status: ACTIVE\n");
+    cli_write_centered_line(io, buf);
+    cli_write_line(io, "");
 }
 
 static void cli_render_atm_menu(const CliIO *io, const CliSessionContext *ctx)
 {
     char buf[256];
 
-    cli_write(io, "\n========================================\n");
-    cli_write(io, "             BANKSYNC ATM\n");
-    cli_write(io, "========================================\n");
-
-    snprintf(buf, sizeof(buf), "Welcome, %s!\n", ctx->customer_name);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Account ID: %d\n", ctx->account_id);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Session ID: %llu\n",
+    cli_write_line(io, "");
+    cli_sep(io, '=');
+    cli_color_line_centered(io, C_BRIGHT_CYAN, "             BANKSYNC ATM");
+    cli_sep(io, '=');
+    cli_write_line(io, "");
+    snprintf(buf, sizeof(buf), "  Welcome, %s!", ctx->customer_name);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Account ID: %d", ctx->account_id);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Account Number: %s", ctx->account_number);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Channel: ATM");
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Session ID: %llu",
              (unsigned long long)ctx->session_id);
-    cli_write(io, buf);
-
-    cli_write(io, "1. Balance Enquiry\n");
-    cli_write(io, "2. Cash Withdrawal\n");
-    cli_write(io, "3. Cash Deposit\n");
-    cli_write(io, "4. Fund Transfer\n");
-    cli_write(io, "5. End Session\n");
-    cli_write(io, "Select an option: ");
+    cli_write_centered_line(io, buf);
+    cli_write_line(io, "");
+    cli_menu_item(io, CLI_ATM_OPTION_BALANCE_ENQUIRY, "Balance Enquiry");
+    cli_menu_item(io, CLI_ATM_OPTION_WITHDRAWAL, "Cash Withdrawal");
+    cli_menu_item(io, CLI_ATM_OPTION_DEPOSIT, "Cash Deposit");
+    cli_menu_item(io, CLI_ATM_OPTION_TRANSFER, "Fund Transfer");
+    cli_menu_item(io, CLI_ATM_OPTION_END_SESSION, "Logout / Return");
+    cli_write_line(io, "");
+    cli_prompt(io, "Select an option: ");
 }
 
 static void cli_render_online_banking_menu(const CliIO *io,
@@ -325,63 +665,38 @@ static void cli_render_online_banking_menu(const CliIO *io,
 {
     char buf[256];
 
-    cli_write(io, "\n========================================\n");
-    cli_write(io, "         BANKSYNC ONLINE BANKING\n");
-    cli_write(io, "========================================\n");
-
-    snprintf(buf, sizeof(buf), "Welcome, %s!\n", ctx->customer_name);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Account ID: %d\n", ctx->account_id);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Session ID: %llu\n",
+    cli_write_line(io, "");
+    cli_sep(io, '=');
+    cli_color_line_centered(io, C_BRIGHT_CYAN, "        BANKSYNC ONLINE BANKING");
+    cli_sep(io, '=');
+    cli_write_line(io, "");
+    snprintf(buf, sizeof(buf), "  Welcome, %s!", ctx->customer_name);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Account ID: %d", ctx->account_id);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Account Number: %s", ctx->account_number);
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Channel: Online Banking");
+    cli_write_centered_line(io, buf);
+    snprintf(buf, sizeof(buf), "  Session ID: %llu",
              (unsigned long long)ctx->session_id);
-    cli_write(io, buf);
-
-    cli_write(io, "1. Balance Enquiry\n");
-    cli_write(io, "2. Deposit Money\n");
-    cli_write(io, "3. Withdraw Money\n");
-    cli_write(io, "4. Fund Transfer\n");
-    cli_write(io, "5. Logout\n");
-    cli_write(io, "Select an option: ");
-}
-
-static void cli_render_session_dashboard(const CliIO *io,
-                                         const CliSessionContext *ctx)
-{
-    char buf[256];
-
-    cli_write(io, "\n========================================\n");
-    cli_write(io, "             CUSTOMER DASHBOARD\n");
-    cli_write(io, "========================================\n");
-
-    snprintf(buf, sizeof(buf), "Welcome, %s!\n", ctx->customer_name);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Account ID: %d\n", ctx->account_id);
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Channel: %s\n",
-             ctx->channel == SESSION_CHANNEL_ATM ? "ATM" : "Online Banking");
-    cli_write(io, buf);
-    snprintf(buf, sizeof(buf), "Session ID: %llu\n",
-             (unsigned long long)ctx->session_id);
-    cli_write(io, buf);
+    cli_write_centered_line(io, buf);
+    cli_write_line(io, "");
+    cli_menu_item(io, CLI_ONLINE_BANKING_OPTION_BALANCE_ENQUIRY,
+                  "Balance Enquiry");
+    cli_menu_item(io, CLI_ONLINE_BANKING_OPTION_DEPOSIT, "Deposit");
+    cli_menu_item(io, CLI_ONLINE_BANKING_OPTION_WITHDRAWAL, "Withdraw");
+    cli_menu_item(io, CLI_ONLINE_BANKING_OPTION_TRANSFER, "Fund Transfer");
+    cli_menu_item(io, CLI_ONLINE_BANKING_OPTION_LOGOUT, "Logout / Return");
+    cli_write_line(io, "");
+    cli_prompt(io, "Select an option: ");
 }
 
 /* ------------------------------------------------------------------ */
 /* Balance display helper                                             */
 /* ------------------------------------------------------------------ */
 
-static void cli_display_balance(const CliIO *io, int64_t balance_paise)
-{
-    char buf[64];
-    int n = money_format_rupees(balance_paise, buf, sizeof(buf));
-    if (n < 0) {
-        cli_write(io, "Balance: <error>\n");
-    } else {
-        cli_write(io, "Balance: ");
-        cli_write(io, buf);
-        cli_write(io, "\n");
-    }
-}
+/* (cli_display_balance defined above with the presentation helpers.) */
 
 /* ------------------------------------------------------------------ */
 /* Session validation helpers                                         */
@@ -457,34 +772,42 @@ static int cli_handle_balance_enquiry(const CliIO *io, Application *app,
 {
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
+    BankStatus bs;
+    int64_t balance = 0;
+    int result;
 
     if (!cli_validate_atm_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    BankStatus bs;
-    int64_t balance = 0;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_BALANCE_ENQUIRY,
         ctx->account_id, 0, 0, &bs, &balance);
 
     if (result != 0) {
-        cli_write(io, "Balance enquiry request failed.\n");
+        cli_error_centered(io, "Balance enquiry request failed.");
         return 0;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Balance enquiry failed.\n");
+        cli_error_centered(io, "Balance enquiry failed.");
+        cli_write_line(io, "");
+        cli_sep(io, '-');
         return 0;
     }
 
-    cli_write(io, "Balance enquiry successful.\n");
-    cli_write(io, "Account ID: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Balance enquiry successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "Account ID: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+    }
     cli_display_balance(io, balance);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -497,54 +820,74 @@ static int cli_handle_cash_withdrawal(const CliIO *io, Application *app,
 {
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
+    BankStatus bs;
+    int64_t amount_paise = 0;
+    int read_result;
+    int result;
 
     if (!cli_validate_atm_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    cli_write(io, "Enter withdrawal amount: ");
-    int64_t amount_paise = 0;
-    int read_result = cli_read_amount(io, &amount_paise);
+    cli_prompt(io, "Enter withdrawal amount: ");
+    read_result = cli_read_amount(io, &amount_paise);
     if (read_result < 0) {
         return 0; /* EOF */
     }
     if (read_result == 0) {
-        cli_write(io, "Invalid amount. Please try again.\n");
+        cli_error_centered(io, "Invalid amount. Please try again.");
         return 1;
     }
     if (amount_paise <= 0) {
-        cli_write(io, "Amount must be greater than zero.\n");
+        cli_error_centered(io, "Amount must be greater than zero.");
         return 1;
     }
 
-    cli_write(io, "Processing withdrawal...\n");
+    cli_write_centered_line(io, "Processing withdrawal...");
 
-    BankStatus bs;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_WITHDRAWAL,
         ctx->account_id, 0, amount_paise, &bs, NULL);
 
     if (result != 0) {
-        cli_write(io, "Withdrawal request failed.\n");
+        cli_error_centered(io, "Withdrawal request failed.");
         return 1;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Withdrawal failed.\n");
+        cli_write_line(io, "");
+        cli_sep(io, '-');
+        cli_error_centered(io, "Withdrawal failed.");
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Reason: %s",
+                     cli_bank_status_message(bs));
+            cli_write_centered_line(io, msg);
+        }
+        cli_sep(io, '-');
+        cli_write_line(io, "");
         return 1;
     }
 
-    cli_write(io, "Withdrawal successful.\n");
-    cli_write(io, "Amount: ");
-    char amt_buf[64];
-    money_format_rupees(amount_paise, amt_buf, sizeof(amt_buf));
-    cli_write(io, amt_buf);
-    cli_write(io, "\n");
-    cli_write(io, "Account ID: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Withdrawal successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "Account ID: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+    }
+    {
+        char amt_buf[64];
+        cli_format_amount(amount_paise, amt_buf, sizeof(amt_buf));
+        char line[128];
+        snprintf(line, sizeof(line), "Amount: %s", amt_buf);
+        cli_write_centered_line(io, line);
+    }
+    cli_show_updated_balance(io, app, ctx->account_id);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -557,54 +900,74 @@ static int cli_handle_cash_deposit(const CliIO *io, Application *app,
 {
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
+    BankStatus bs;
+    int64_t amount_paise = 0;
+    int read_result;
+    int result;
 
     if (!cli_validate_atm_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    cli_write(io, "Enter deposit amount: ");
-    int64_t amount_paise = 0;
-    int read_result = cli_read_amount(io, &amount_paise);
+    cli_prompt(io, "Enter deposit amount: ");
+    read_result = cli_read_amount(io, &amount_paise);
     if (read_result < 0) {
         return 0; /* EOF */
     }
     if (read_result == 0) {
-        cli_write(io, "Invalid amount. Please try again.\n");
+        cli_error_centered(io, "Invalid amount. Please try again.");
         return 1;
     }
     if (amount_paise <= 0) {
-        cli_write(io, "Amount must be greater than zero.\n");
+        cli_error_centered(io, "Amount must be greater than zero.");
         return 1;
     }
 
-    cli_write(io, "Processing deposit...\n");
+    cli_write_centered_line(io, "Processing deposit...");
 
-    BankStatus bs;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_DEPOSIT,
         ctx->account_id, 0, amount_paise, &bs, NULL);
 
     if (result != 0) {
-        cli_write(io, "Deposit request failed.\n");
+        cli_error_centered(io, "Deposit request failed.");
         return 1;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Deposit failed.\n");
+        cli_write_line(io, "");
+        cli_sep(io, '-');
+        cli_error_centered(io, "Deposit failed.");
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Reason: %s",
+                     cli_bank_status_message(bs));
+            cli_write_centered_line(io, msg);
+        }
+        cli_sep(io, '-');
+        cli_write_line(io, "");
         return 1;
     }
 
-    cli_write(io, "Deposit successful.\n");
-    cli_write(io, "Amount: ");
-    char amt_buf[64];
-    money_format_rupees(amount_paise, amt_buf, sizeof(amt_buf));
-    cli_write(io, amt_buf);
-    cli_write(io, "\n");
-    cli_write(io, "Account ID: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Deposit successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "Account ID: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+    }
+    {
+        char amt_buf[64];
+        cli_format_amount(amount_paise, amt_buf, sizeof(amt_buf));
+        char line[128];
+        snprintf(line, sizeof(line), "Amount: %s", amt_buf);
+        cli_write_centered_line(io, line);
+    }
+    cli_show_updated_balance(io, app, ctx->account_id);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -618,85 +981,103 @@ static int cli_handle_fund_transfer(const CliIO *io, Application *app,
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
     Bank *bank = application_get_bank(app);
+    BankStatus bs;
+    int64_t amount_paise = 0;
+    int dest_account_id = 0;
+    int read_result;
+    int result;
+    char buf[CLI_INPUT_BUFFER_SIZE];
 
     if (!cli_validate_atm_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    cli_write(io, "Enter destination account ID: ");
-    char buf[CLI_INPUT_BUFFER_SIZE];
-    int n = cli_read_line(io, buf, sizeof(buf));
-    if (n < 0) {
+    cli_prompt(io, "Enter destination account ID: ");
+    read_result = cli_read_line(io, buf, sizeof(buf));
+    if (read_result < 0) {
         return 0; /* EOF */
     }
     if (cli_is_all_whitespace(buf)) {
-        cli_write(io, "Invalid input. Please enter a valid Account ID.\n");
+        cli_error_centered(io, "Invalid input. Please enter a valid Account ID.");
         return 1;
     }
 
-    int dest_account_id = 0;
     if (!cli_parse_uint(buf, &dest_account_id)) {
-        cli_write(io, "Invalid input. Account ID must be a number.\n");
+        cli_error_centered(io, "Invalid input. Account ID must be a number.");
         return 1;
     }
 
     if (dest_account_id == ctx->account_id) {
-        cli_write(io, "Cannot transfer to the same account.\n");
+        cli_error_centered(io, "Cannot transfer to the same account.");
         return 1;
     }
 
-    BankAccount *dest_acc = bank_find_account(bank, dest_account_id);
-    if (dest_acc == NULL) {
-        cli_write(io, "Unknown destination account ID.\n");
+    if (bank_find_account(bank, dest_account_id) == NULL) {
+        cli_error_centered(io, "Unknown destination account ID.");
         return 1;
     }
 
-    cli_write(io, "Enter transfer amount: ");
-    int64_t amount_paise = 0;
-    int read_result = cli_read_amount(io, &amount_paise);
+    cli_prompt(io, "Enter transfer amount: ");
+    read_result = cli_read_amount(io, &amount_paise);
     if (read_result < 0) {
         return 0; /* EOF */
     }
     if (read_result == 0) {
-        cli_write(io, "Invalid amount. Please try again.\n");
+        cli_error_centered(io, "Invalid amount. Please try again.");
         return 1;
     }
     if (amount_paise <= 0) {
-        cli_write(io, "Amount must be greater than zero.\n");
+        cli_error_centered(io, "Amount must be greater than zero.");
         return 1;
     }
 
-    cli_write(io, "Processing transfer...\n");
+    cli_write_centered_line(io, "Processing transfer...");
 
-    BankStatus bs;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_TRANSFER,
         ctx->account_id, dest_account_id, amount_paise, &bs, NULL);
 
     if (result != 0) {
-        cli_write(io, "Transfer request failed.\n");
+        cli_error_centered(io, "Transfer request failed.");
         return 1;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Transfer failed.\n");
+        cli_write_line(io, "");
+        cli_sep(io, '-');
+        cli_error_centered(io, "Transfer failed.");
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Reason: %s",
+                     cli_bank_status_message(bs));
+            cli_write_centered_line(io, msg);
+        }
+        cli_sep(io, '-');
+        cli_write_line(io, "");
         return 1;
     }
 
-    cli_write(io, "Transfer successful.\n");
-    cli_write(io, "From Account: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
-    cli_write(io, "To Account: ");
-    snprintf(id_buf, sizeof(id_buf), "%d\n", dest_account_id);
-    cli_write(io, id_buf);
-    cli_write(io, "Amount: ");
-    char amt_buf[64];
-    money_format_rupees(amount_paise, amt_buf, sizeof(amt_buf));
-    cli_write(io, amt_buf);
-    cli_write(io, "\n");
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Transfer successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "From Account: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+        snprintf(id_buf, sizeof(id_buf), "To Account: %d", dest_account_id);
+        cli_write_centered_line(io, id_buf);
+    }
+    {
+        char amt_buf[64];
+        cli_format_amount(amount_paise, amt_buf, sizeof(amt_buf));
+        char line[128];
+        snprintf(line, sizeof(line), "Amount: %s", amt_buf);
+        cli_write_centered_line(io, line);
+    }
+    cli_show_updated_balance(io, app, ctx->account_id);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -714,34 +1095,40 @@ static int cli_handle_online_balance_enquiry(const CliIO *io, Application *app,
 {
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
+    BankStatus bs;
+    int64_t balance = 0;
+    int result;
 
     if (!cli_validate_online_banking_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    BankStatus bs;
-    int64_t balance = 0;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_BALANCE_ENQUIRY,
         ctx->account_id, 0, 0, &bs, &balance);
 
     if (result != 0) {
-        cli_write(io, "Balance enquiry request failed.\n");
+        cli_error_centered(io, "Balance enquiry request failed.");
         return 0;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Balance enquiry failed.\n");
+        cli_error_centered(io, "Balance enquiry failed.");
         return 0;
     }
 
-    cli_write(io, "Balance enquiry successful.\n");
-    cli_write(io, "Account ID: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Balance enquiry successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "Account ID: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+    }
     cli_display_balance(io, balance);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -754,54 +1141,74 @@ static int cli_handle_online_deposit(const CliIO *io, Application *app,
 {
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
+    BankStatus bs;
+    int64_t amount_paise = 0;
+    int read_result;
+    int result;
 
     if (!cli_validate_online_banking_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    cli_write(io, "Enter deposit amount: ");
-    int64_t amount_paise = 0;
-    int read_result = cli_read_amount(io, &amount_paise);
+    cli_prompt(io, "Enter deposit amount: ");
+    read_result = cli_read_amount(io, &amount_paise);
     if (read_result < 0) {
         return 0; /* EOF */
     }
     if (read_result == 0) {
-        cli_write(io, "Invalid amount. Please try again.\n");
+        cli_error_centered(io, "Invalid amount. Please try again.");
         return 1;
     }
     if (amount_paise <= 0) {
-        cli_write(io, "Amount must be greater than zero.\n");
+        cli_error_centered(io, "Amount must be greater than zero.");
         return 1;
     }
 
-    cli_write(io, "Processing deposit...\n");
+    cli_write_centered_line(io, "Processing deposit...");
 
-    BankStatus bs;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_DEPOSIT,
         ctx->account_id, 0, amount_paise, &bs, NULL);
 
     if (result != 0) {
-        cli_write(io, "Deposit request failed.\n");
+        cli_error_centered(io, "Deposit request failed.");
         return 1;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Deposit failed.\n");
+        cli_write_line(io, "");
+        cli_sep(io, '-');
+        cli_error_centered(io, "Deposit failed.");
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Reason: %s",
+                     cli_bank_status_message(bs));
+            cli_write_centered_line(io, msg);
+        }
+        cli_sep(io, '-');
+        cli_write_line(io, "");
         return 1;
     }
 
-    cli_write(io, "Deposit successful.\n");
-    cli_write(io, "Amount: ");
-    char amt_buf[64];
-    money_format_rupees(amount_paise, amt_buf, sizeof(amt_buf));
-    cli_write(io, amt_buf);
-    cli_write(io, "\n");
-    cli_write(io, "Account ID: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Deposit successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "Account ID: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+    }
+    {
+        char amt_buf[64];
+        cli_format_amount(amount_paise, amt_buf, sizeof(amt_buf));
+        char line[128];
+        snprintf(line, sizeof(line), "Amount: %s", amt_buf);
+        cli_write_centered_line(io, line);
+    }
+    cli_show_updated_balance(io, app, ctx->account_id);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -814,54 +1221,74 @@ static int cli_handle_online_withdrawal(const CliIO *io, Application *app,
 {
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
+    BankStatus bs;
+    int64_t amount_paise = 0;
+    int read_result;
+    int result;
 
     if (!cli_validate_online_banking_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    cli_write(io, "Enter withdrawal amount: ");
-    int64_t amount_paise = 0;
-    int read_result = cli_read_amount(io, &amount_paise);
+    cli_prompt(io, "Enter withdrawal amount: ");
+    read_result = cli_read_amount(io, &amount_paise);
     if (read_result < 0) {
         return 0; /* EOF */
     }
     if (read_result == 0) {
-        cli_write(io, "Invalid amount. Please try again.\n");
+        cli_error_centered(io, "Invalid amount. Please try again.");
         return 1;
     }
     if (amount_paise <= 0) {
-        cli_write(io, "Amount must be greater than zero.\n");
+        cli_error_centered(io, "Amount must be greater than zero.");
         return 1;
     }
 
-    cli_write(io, "Processing withdrawal...\n");
+    cli_write_centered_line(io, "Processing withdrawal...");
 
-    BankStatus bs;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_WITHDRAWAL,
         ctx->account_id, 0, amount_paise, &bs, NULL);
 
     if (result != 0) {
-        cli_write(io, "Withdrawal request failed.\n");
+        cli_error_centered(io, "Withdrawal request failed.");
         return 1;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Withdrawal failed.\n");
+        cli_write_line(io, "");
+        cli_sep(io, '-');
+        cli_error_centered(io, "Withdrawal failed.");
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Reason: %s",
+                     cli_bank_status_message(bs));
+            cli_write_centered_line(io, msg);
+        }
+        cli_sep(io, '-');
+        cli_write_line(io, "");
         return 1;
     }
 
-    cli_write(io, "Withdrawal successful.\n");
-    cli_write(io, "Amount: ");
-    char amt_buf[64];
-    money_format_rupees(amount_paise, amt_buf, sizeof(amt_buf));
-    cli_write(io, amt_buf);
-    cli_write(io, "\n");
-    cli_write(io, "Account ID: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Withdrawal successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "Account ID: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+    }
+    {
+        char amt_buf[64];
+        cli_format_amount(amount_paise, amt_buf, sizeof(amt_buf));
+        char line[128];
+        snprintf(line, sizeof(line), "Amount: %s", amt_buf);
+        cli_write_centered_line(io, line);
+    }
+    cli_show_updated_balance(io, app, ctx->account_id);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -875,85 +1302,103 @@ static int cli_handle_online_transfer(const CliIO *io, Application *app,
     SessionManager *sm = application_get_session_manager(app);
     TransactionManager *tm = &app->txn_mgr;
     Bank *bank = application_get_bank(app);
+    BankStatus bs;
+    int64_t amount_paise = 0;
+    int dest_account_id = 0;
+    int read_result;
+    int result;
+    char buf[CLI_INPUT_BUFFER_SIZE];
 
     if (!cli_validate_online_banking_session(sm, ctx)) {
-        cli_write(io, "Session is not active. Returning to main menu.\n");
+        cli_error_centered(io, "Session is not active. Returning to main menu.");
         return 0;
     }
 
-    cli_write(io, "Enter destination account ID: ");
-    char buf[CLI_INPUT_BUFFER_SIZE];
-    int n = cli_read_line(io, buf, sizeof(buf));
-    if (n < 0) {
+    cli_prompt(io, "Enter destination account ID: ");
+    read_result = cli_read_line(io, buf, sizeof(buf));
+    if (read_result < 0) {
         return 0; /* EOF */
     }
     if (cli_is_all_whitespace(buf)) {
-        cli_write(io, "Invalid input. Please enter a valid Account ID.\n");
+        cli_error_centered(io, "Invalid input. Please enter a valid Account ID.");
         return 1;
     }
 
-    int dest_account_id = 0;
     if (!cli_parse_uint(buf, &dest_account_id)) {
-        cli_write(io, "Invalid input. Account ID must be a number.\n");
+        cli_error_centered(io, "Invalid input. Account ID must be a number.");
         return 1;
     }
 
     if (dest_account_id == ctx->account_id) {
-        cli_write(io, "Cannot transfer to the same account.\n");
+        cli_error_centered(io, "Cannot transfer to the same account.");
         return 1;
     }
 
-    BankAccount *dest_acc = bank_find_account(bank, dest_account_id);
-    if (dest_acc == NULL) {
-        cli_write(io, "Unknown destination account ID.\n");
+    if (bank_find_account(bank, dest_account_id) == NULL) {
+        cli_error_centered(io, "Unknown destination account ID.");
         return 1;
     }
 
-    cli_write(io, "Enter transfer amount: ");
-    int64_t amount_paise = 0;
-    int read_result = cli_read_amount(io, &amount_paise);
+    cli_prompt(io, "Enter transfer amount: ");
+    read_result = cli_read_amount(io, &amount_paise);
     if (read_result < 0) {
         return 0; /* EOF */
     }
     if (read_result == 0) {
-        cli_write(io, "Invalid amount. Please try again.\n");
+        cli_error_centered(io, "Invalid amount. Please try again.");
         return 1;
     }
     if (amount_paise <= 0) {
-        cli_write(io, "Amount must be greater than zero.\n");
+        cli_error_centered(io, "Amount must be greater than zero.");
         return 1;
     }
 
-    cli_write(io, "Processing transfer...\n");
+    cli_write_centered_line(io, "Processing transfer...");
 
-    BankStatus bs;
-    int result = cli_submit_transaction(
+    result = cli_submit_transaction(
         sm, tm, ctx->session_id, TRANSACTION_OP_TRANSFER,
         ctx->account_id, dest_account_id, amount_paise, &bs, NULL);
 
     if (result != 0) {
-        cli_write(io, "Transfer request failed.\n");
+        cli_error_centered(io, "Transfer request failed.");
         return 1;
     }
 
     if (bs != BANK_SUCCESS) {
-        cli_write(io, "Transfer failed.\n");
+        cli_write_line(io, "");
+        cli_sep(io, '-');
+        cli_error_centered(io, "Transfer failed.");
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Reason: %s",
+                     cli_bank_status_message(bs));
+            cli_write_centered_line(io, msg);
+        }
+        cli_sep(io, '-');
+        cli_write_line(io, "");
         return 1;
     }
 
-    cli_write(io, "Transfer successful.\n");
-    cli_write(io, "From Account: ");
-    char id_buf[16];
-    snprintf(id_buf, sizeof(id_buf), "%d\n", ctx->account_id);
-    cli_write(io, id_buf);
-    cli_write(io, "To Account: ");
-    snprintf(id_buf, sizeof(id_buf), "%d\n", dest_account_id);
-    cli_write(io, id_buf);
-    cli_write(io, "Amount: ");
-    char amt_buf[64];
-    money_format_rupees(amount_paise, amt_buf, sizeof(amt_buf));
-    cli_write(io, amt_buf);
-    cli_write(io, "\n");
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_success_centered(io, "Transfer successful.");
+    {
+        char id_buf[32];
+        snprintf(id_buf, sizeof(id_buf), "From Account: %d", ctx->account_id);
+        cli_write_centered_line(io, id_buf);
+        snprintf(id_buf, sizeof(id_buf), "To Account: %d", dest_account_id);
+        cli_write_centered_line(io, id_buf);
+    }
+    {
+        char amt_buf[64];
+        cli_format_amount(amount_paise, amt_buf, sizeof(amt_buf));
+        char line[128];
+        snprintf(line, sizeof(line), "Amount: %s", amt_buf);
+        cli_write_centered_line(io, line);
+    }
+    cli_show_updated_balance(io, app, ctx->account_id);
+    cli_sep(io, '-');
+    cli_write_line(io, "");
     return 1;
 }
 
@@ -979,13 +1424,13 @@ static CliState cli_handle_main_menu(const CliIO *io, Application *app,
     }
 
     if (cli_is_all_whitespace(buf)) {
-        cli_write(io, "Invalid selection. Please enter 1, 2, or 3.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1, 2, or 3.");
         return CLI_STATE_MAIN_MENU;
     }
 
     int choice = 0;
     if (!cli_parse_uint(buf, &choice)) {
-        cli_write(io, "Invalid selection. Please enter 1, 2, or 3.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1, 2, or 3.");
         return CLI_STATE_MAIN_MENU;
     }
 
@@ -999,7 +1444,7 @@ static CliState cli_handle_main_menu(const CliIO *io, Application *app,
     case CLI_OPTION_EXIT:
         return CLI_STATE_EXIT;
     default:
-        cli_write(io, "Invalid selection. Please enter 1, 2, or 3.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1, 2, or 3.");
         return CLI_STATE_MAIN_MENU;
     }
 }
@@ -1024,19 +1469,19 @@ static CliState cli_handle_account_selection(const CliIO *io, Application *app,
     }
 
     if (cli_is_all_whitespace(buf)) {
-        cli_write(io, "Invalid input. Please enter a valid Account ID.\n");
+        cli_error_centered(io, "Invalid input. Please enter a valid Account ID.");
         return CLI_STATE_ACCOUNT_SELECTION;
     }
 
     int account_id = 0;
     if (!cli_parse_uint(buf, &account_id)) {
-        cli_write(io, "Invalid input. Account ID must be a number.\n");
+        cli_error_centered(io, "Invalid input. Account ID must be a number.");
         return CLI_STATE_ACCOUNT_SELECTION;
     }
 
     BankAccount *acc = bank_find_account(bank, account_id);
     if (acc == NULL) {
-        cli_write(io, "Unknown account ID. Please try again.\n");
+        cli_error_centered(io, "Unknown account ID. Please try again.");
         return CLI_STATE_ACCOUNT_SELECTION;
     }
 
@@ -1045,7 +1490,7 @@ static CliState cli_handle_account_selection(const CliIO *io, Application *app,
     SessionManagerStatus sms = session_create(
         sm, account_id, selected_channel, &session_id);
     if (sms != SESSION_MANAGER_SUCCESS) {
-        cli_write(io, "Failed to create session. Please try again.\n");
+        cli_error_centered(io, "Failed to create session. Please try again.");
         return CLI_STATE_ACCOUNT_SELECTION;
     }
 
@@ -1062,16 +1507,18 @@ static CliState cli_handle_account_selection(const CliIO *io, Application *app,
 }
 
 /*
- * cli_handle_session_dashboard — display the dashboard and route based on
- * channel. ATM sessions proceed to ATM operations; Online Banking sessions
- * proceed to Online Banking operations.
- * Returns the next state.
+ * cli_handle_session_dashboard — confirm the active session and route to the
+ * channel-specific operation menu. Returns the next state.
  */
 static CliState cli_handle_session_dashboard(const CliIO *io, Application *app,
                                              CliSessionContext *ctx)
 {
     (void)app;
-    cli_render_session_dashboard(io, ctx);
+    cli_write_line(io, "");
+    cli_sep(io, '-');
+    cli_write_centered_line(io, "  Session active. Proceed to operations.");
+    cli_sep(io, '-');
+    cli_write_line(io, "");
 
     if (ctx->channel == SESSION_CHANNEL_ATM) {
         return CLI_STATE_ATM_OPERATIONS;
@@ -1097,13 +1544,13 @@ static CliState cli_handle_atm_operations(const CliIO *io, Application *app,
     }
 
     if (cli_is_all_whitespace(buf)) {
-        cli_write(io, "Invalid selection. Please enter 1 through 5.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1 through 5.");
         return CLI_STATE_ATM_OPERATIONS;
     }
 
     int choice = 0;
     if (!cli_parse_uint(buf, &choice)) {
-        cli_write(io, "Invalid selection. Please enter 1 through 5.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1 through 5.");
         return CLI_STATE_ATM_OPERATIONS;
     }
 
@@ -1124,9 +1571,10 @@ static CliState cli_handle_atm_operations(const CliIO *io, Application *app,
         SessionManager *sm = application_get_session_manager(app);
         SessionManagerStatus sms = session_terminate(sm, ctx->session_id);
         if (sms != SESSION_MANAGER_SUCCESS) {
-            cli_write(io, "Failed to terminate session.\n");
+            cli_error_centered(io, "Failed to terminate session.");
         } else {
-            cli_write(io, "\nSession terminated.\n");
+            cli_write_line(io, "");
+            cli_success_centered(io, "Session terminated.");
         }
         ctx->has_session = 0;
         ctx->session_id = 0;
@@ -1137,7 +1585,7 @@ static CliState cli_handle_atm_operations(const CliIO *io, Application *app,
         return CLI_STATE_MAIN_MENU;
     }
     default:
-        cli_write(io, "Invalid selection. Please enter 1 through 5.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1 through 5.");
         return CLI_STATE_ATM_OPERATIONS;
     }
 }
@@ -1161,13 +1609,13 @@ static CliState cli_handle_online_banking_operations(const CliIO *io,
     }
 
     if (cli_is_all_whitespace(buf)) {
-        cli_write(io, "Invalid selection. Please enter 1 through 5.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1 through 5.");
         return CLI_STATE_ONLINE_BANKING_OPERATIONS;
     }
 
     int choice = 0;
     if (!cli_parse_uint(buf, &choice)) {
-        cli_write(io, "Invalid selection. Please enter 1 through 5.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1 through 5.");
         return CLI_STATE_ONLINE_BANKING_OPERATIONS;
     }
 
@@ -1188,9 +1636,10 @@ static CliState cli_handle_online_banking_operations(const CliIO *io,
         SessionManager *sm = application_get_session_manager(app);
         SessionManagerStatus sms = session_terminate(sm, ctx->session_id);
         if (sms != SESSION_MANAGER_SUCCESS) {
-            cli_write(io, "Failed to terminate session.\n");
+            cli_error_centered(io, "Failed to terminate session.");
         } else {
-            cli_write(io, "\nLogged out.\n");
+            cli_write_line(io, "");
+            cli_success_centered(io, "Logged out.");
         }
         ctx->has_session = 0;
         ctx->session_id = 0;
@@ -1201,7 +1650,7 @@ static CliState cli_handle_online_banking_operations(const CliIO *io,
         return CLI_STATE_MAIN_MENU;
     }
     default:
-        cli_write(io, "Invalid selection. Please enter 1 through 5.\n");
+        cli_error_centered(io, "Invalid selection. Please enter 1 through 5.");
         return CLI_STATE_ONLINE_BANKING_OPERATIONS;
     }
 }
@@ -1250,5 +1699,18 @@ void cli_run(Application *app)
     io.read_line = cli_read_stdin;
     io.write = cli_write_stdout;
     io.ctx = NULL;
+
+    cli_colour = 0;
+#if defined(_WIN32)
+    cli_enable_vt_processing();
+    /* Configure the Windows console to interpret output as UTF-8 so that
+     * Unicode currency symbols (e.g. ₹) render correctly instead of being
+     * misread as legacy code-page characters. */
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+    if (cli_isatty_stream(stdout)) {
+        cli_colour = 1;
+    }
+
     cli_run_with_io(app, &io);
 }
